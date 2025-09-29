@@ -1,0 +1,631 @@
+package com.example.fyp;
+
+// ===== ANDROID CORE =====
+import android.Manifest;
+import android.content.ContentProviderOperation;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.provider.ContactsContract;
+import android.speech.RecognizerIntent;
+import android.speech.tts.TextToSpeech;
+import android.widget.Button;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+
+// ===== JAVA CORE =====
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+// ===== JSON =====
+import org.json.JSONObject;
+
+public class MainActivity extends AppCompatActivity {
+
+    // --- UI ---
+    private TextView tvResult;
+    private Button btnSpeak;
+
+    // --- Core ---
+    private TextToSpeech tts;
+    private Vibrator vibrator;
+    private ActivityResultLauncher<Intent> speechLauncher;
+
+    // --- State ---
+    private String currentAction = null; // "call", "dial", "add_contact", "news"
+    private int stepIndex = 0;
+    private String tempName = null;
+    private String tempNumber = null;
+
+    // --- News ---
+    private org.json.JSONArray newsArticles = null;
+    private int newsIndex = 0;
+
+    // --- Config ---
+    private final float DEFAULT_SPEECH_RATE = 0.8f;
+
+    // =========================================================
+    // LIFECYCLE
+    // =========================================================
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        tvResult = findViewById(R.id.tvResult);
+        btnSpeak = findViewById(R.id.btnSpeak);
+        vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+
+        // --- Speech recognizer ---
+        speechLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                        ArrayList<String> matches = result.getData().getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+                        String userSpeech = matches.get(0).toLowerCase();
+                        tvResult.setText(userSpeech);
+                        processCommand(userSpeech);
+                    }
+                });
+
+        // --- Initialize TTS ---
+        tts = new TextToSpeech(this, status -> {
+            if (status == TextToSpeech.SUCCESS) {
+                Locale localeMY = new Locale("en", "MY");
+                int result = tts.setLanguage(localeMY);
+                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    Toast.makeText(MainActivity.this, "TTS language en-MY not supported, using default.", Toast.LENGTH_SHORT).show();
+                    tts.setLanguage(Locale.getDefault());
+                }
+                tts.setSpeechRate(DEFAULT_SPEECH_RATE);
+                tts.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
+                    @Override
+                    public void onStart(String utteranceId) {}
+
+                    @Override
+                    public void onDone(String utteranceId) {
+                        runOnUiThread(() -> {
+                            if ("guide".equals(utteranceId) || "reset".equals(utteranceId)
+                                    || "time_response".equals(utteranceId)
+                                    || "date_response".equals(utteranceId)
+                                    || "weather_response".equals(utteranceId)) {
+                                startVoiceInput();
+                            } else if (currentAction != null) {
+                                startVoiceInput();
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onError(String utteranceId) {}
+                });
+                guideUserMenu();
+            }
+        });
+
+        // --- Permissions ---
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+        }
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CALL_PHONE}, 2);
+        }
+
+        btnSpeak.setOnClickListener(v -> startVoiceInput());
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (tts != null) {
+            tts.stop();
+            tts.shutdown();
+        }
+        super.onDestroy();
+    }
+
+    // =========================================================
+    // UTILITIES
+    // =========================================================
+    private void readNextHeadline() {
+        try {
+            if (newsArticles != null && newsIndex < newsArticles.length()) {
+                String headline = newsArticles.getJSONObject(newsIndex).getString("title");
+                speakText("Headline " + (newsIndex + 1) + ": " + headline + ". Do you want to hear more?", "news_response");
+                newsIndex++;
+            } else {
+                speakText("That's all the news for now. Returning to menu.", "reset");
+                resetCallFlow();
+            }
+        } catch (Exception e) {
+            speakText("Sorry, I had trouble reading the news. Returning to menu.", "reset");
+            resetCallFlow();
+        }
+    }
+
+    private String readStream(HttpURLConnection connection) throws Exception {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+        StringBuilder result = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            result.append(line);
+        }
+        reader.close();
+        return result.toString();
+    }
+
+    private void speakText(String text, String utteranceId) {
+        Bundle params = new Bundle();
+        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId);
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId);
+    }
+
+    private void speakConfirm(String text) {
+        tts.setSpeechRate(0.7f);
+        speakText(text, "reset");
+        tts.setSpeechRate(DEFAULT_SPEECH_RATE);
+    }
+
+    private void vibrateTwice() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            long[] timings = {0, 200, 200, 200};
+            vibrator.vibrate(VibrationEffect.createWaveform(timings, -1));
+        } else {
+            vibrator.vibrate(new long[]{0, 200, 200, 200}, -1);
+        }
+    }
+
+    private void repeatLastStep() {
+        if ("call".equals(currentAction)) {
+            if (stepIndex == 1) {
+                speakText("Tell me the name.", "reset");
+            } else if (stepIndex == 2) {
+                speakText("Did you say " + tempName + "?", "reset");
+            } else if (stepIndex == 3) {
+                speakText("Call failed. Say again to retry, or say later to return to menu.", "reset");
+            }
+        } else if ("dial".equals(currentAction)) {
+            if (stepIndex == 1) {
+                speakText("Tell me the digits.", "reset");
+            } else if (stepIndex == 2) {
+                speakConfirm("Did you say " + tempNumber + "?");
+            } else if (stepIndex == 3) {
+                speakText("Call failed. Say again to retry, or say later to return to menu.", "reset");
+            }
+        } else if ("add_contact".equals(currentAction)) {
+            if (stepIndex == 1) {
+                speakText("Tell me the contact name.", "reset");
+            } else if (stepIndex == 2) {
+                speakText("Now tell me the number for " + tempName, "reset");
+            } else if (stepIndex == 3) {
+                speakText("Did you say " + tempName + " with number " + tempNumber + "?", "reset");
+            }
+        }
+    }
+
+    private String cleanNumber(String input) {
+        return input.replaceAll("[^0-9]", "");
+    }
+
+    private boolean isValidMalaysiaNumber(String number) {
+        return number.matches("^0\\d{9,10}$");
+    }
+
+    private void resetCallFlow() {
+        currentAction = null;
+        stepIndex = 0;
+        tempName = null;
+        tempNumber = null;
+        guideUserMenu();
+    }
+
+    private void saveContact(String name, String number) {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.WRITE_CONTACTS)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.WRITE_CONTACTS}, 4);
+            speakText("Please grant contacts permission and try again.", "reset");
+            return;
+        }
+
+        ArrayList<ContentProviderOperation> ops = new ArrayList<>();
+
+        ops.add(ContentProviderOperation.newInsert(ContactsContract.RawContacts.CONTENT_URI)
+                .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, null)
+                .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, null)
+                .build());
+
+        // Name
+        ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
+                .withValue(ContactsContract.Data.MIMETYPE,
+                        ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE)
+                .withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, name)
+                .build());
+
+        // Phone Number
+        ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
+                .withValue(ContactsContract.Data.MIMETYPE,
+                        ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
+                .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, number)
+                .withValue(ContactsContract.CommonDataKinds.Phone.TYPE,
+                        ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
+                .build());
+        try {
+            getContentResolver().applyBatch(ContactsContract.AUTHORITY, ops);
+            speakText("Contact saved successfully. Returning to menu.", "reset");
+            resetCallFlow();
+        } catch (Exception e) {
+            speakText("Failed to save contact. Returning to menu.", "reset");
+        }
+    }
+
+    private String findMatchingContact(String spokenName) {
+        SharedPreferences prefs = getSharedPreferences("contacts", MODE_PRIVATE);
+        for (String key : prefs.getAll().keySet()) {
+            if (spokenName.contains(key) || key.contains(spokenName)) {
+                return prefs.getString(key, null);
+            }
+        }
+        return null;
+    }
+
+    private boolean makePhoneCall(String phoneNumber) {
+        try {
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CALL_PHONE}, 2);
+                speakText("Please grant call permission and try again", "reset");
+                return false;
+            }
+            Intent intent = new Intent(Intent.ACTION_CALL);
+            intent.setData(Uri.parse("tel:" + phoneNumber));
+            startActivity(intent);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private String getContactNumber(String name) {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.READ_CONTACTS}, 3);
+            speakText("Please grant contacts permission and try again.", "reset");
+            return null;
+        }
+
+        String phoneNumber = null;
+        Uri uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI;
+        String[] projection = {ContactsContract.CommonDataKinds.Phone.NUMBER};
+        String selection = ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?";
+        String[] selectionArgs = {"%" + name + "%"};
+
+        try (Cursor cursor = getContentResolver().query(uri, projection, selection, selectionArgs, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                phoneNumber = cursor.getString(0);
+            }
+        }
+        return phoneNumber;
+    }
+
+    // =========================================================
+    // MENU & INPUT
+    // =========================================================
+    private void guideUserMenu() {
+        speakText("How can I help you? You can say: tell me the time, tell me the date, what is the weather in city, or say call, dial, add contact, or news.", "guide");
+        vibrateTwice();
+    }
+
+    private void startVoiceInput() {
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-MY");
+        speechLauncher.launch(intent);
+    }
+
+    // =========================================================
+    // WEATHER & NEWS
+    // =========================================================
+    private void fetchWeather(String city) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Handler handler = new Handler(Looper.getMainLooper());
+        executor.execute(() -> {
+            try {
+                String apiKey = "49fdb54f6a3ef012fda900f7c217a9a3";
+                String apiUrl = "https://api.openweathermap.org/data/2.5/weather?q=" + city + "&appid=" + apiKey + "&units=metric";
+                HttpURLConnection connection = (HttpURLConnection) new URL(apiUrl).openConnection();
+                connection.setRequestMethod("GET");
+
+                BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+                StringBuilder result = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) result.append(line);
+
+                handler.post(() -> {
+                    try {
+                        JSONObject json = new JSONObject(result.toString());
+                        JSONObject main = json.getJSONObject("main");
+                        double temp = main.getDouble("temp");
+                        int humidity = main.getInt("humidity");
+                        String description = json.getJSONArray("weather").getJSONObject(0).getString("description");
+                        speakText("In " + city + ", it is currently " + description + " with " + temp + " degrees Celsius and " + humidity + " percent humidity. Say start to return to menu.", "weather_response");
+                    } catch (Exception e) {
+                        speakText("Sorry, I couldn't parse the weather information.", "weather_response");
+                    }
+                });
+            } catch (Exception e) {
+                handler.post(() -> speakText("Sorry, I couldn't retrieve the weather.", "weather_response"));
+            }
+        });
+    }
+
+    private void fetchNews() {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Handler handler = new Handler(Looper.getMainLooper());
+        executor.execute(() -> {
+            try {
+                String apiKey = "30b32026d6754a568798740321665991"; // your NewsAPI key
+                String apiUrl = "https://newsapi.org/v2/top-headlines?country=my&apiKey=" + apiKey;
+
+                HttpURLConnection connection = (HttpURLConnection) new URL(apiUrl).openConnection();
+                connection.setRequestMethod("GET");
+
+                String response = readStream(connection);
+
+                handler.post(() -> {
+                    try {
+                        JSONObject json = new JSONObject(response);
+                        if (json.getString("status").equals("ok")) {
+                            newsArticles = json.getJSONArray("articles");
+                            newsIndex = 0;
+                            readNextHeadline();
+                            currentAction = "news";
+                        } else {
+                            speakText("Sorry, I couldn't fetch the news right now.", "news_response");
+                        }
+                    } catch (Exception e) {
+                        speakText("Sorry, I couldn't parse the news information.", "news_response");
+                    }
+                });
+            } catch (Exception e) {
+                handler.post(() -> speakText("Sorry, I couldn't retrieve the news.", "news_response"));
+            }
+        });
+    }
+
+    // =========================================================
+    // CALL / DIAL / ADD CONTACT FLOW
+    // =========================================================
+    private void handleCallFlow(String userSpeech) {
+               userSpeech = userSpeech.toLowerCase();
+               if (userSpeech.contains("cancel") || userSpeech.contains("menu")) {
+                   speakText("Cancelled. Returning to main menu.", "reset");
+                   resetCallFlow();
+                   return;
+               }
+
+               if (currentAction == null) {
+                   if (userSpeech.contains("call")) {
+                       currentAction = "call";
+                       stepIndex = 1;
+                       speakText("Tell me the name.", "reset");
+                       return;
+                   } else if (userSpeech.contains("dial")) {
+                       currentAction = "dial";
+                       stepIndex = 1;
+                       speakText("Tell me the digits.", "reset");
+                       return;
+                   } else if (userSpeech.contains("add contact")) {
+                       currentAction = "add_contact";
+                       stepIndex = 1;
+                       speakText("Tell me the contact name.", "reset");
+                       return;
+                   }
+               }
+
+               if ("call".equals(currentAction)) {
+                   if (stepIndex == 1) {
+                       tempName = userSpeech.trim();
+                       speakConfirm("Did you say " + tempName + "?");
+                       stepIndex = 2;
+                   } else if (stepIndex == 2) {
+                       if (userSpeech.contains("yes")) {
+                           String number = getContactNumber(tempName);
+                           if (number != null) {
+                               boolean success = makePhoneCall(number);
+                               if (!success) {
+                                   speakText("Call failed. Say again to retry, or later to return to menu.", "reset");
+                                   stepIndex = 3;
+                               } else resetCallFlow();
+                           } else {
+                               speakText("I don't have that contact saved. Returning to menu.", "reset");
+                               resetCallFlow();
+                           }
+                       } else {
+                           speakText("Okay, returning to menu.", "reset");
+                           resetCallFlow();
+                       }
+                   } else if (stepIndex == 3) {
+                       if (userSpeech.contains("again")) {
+                           String number = findMatchingContact(tempName);
+                           if (number != null) makePhoneCall(number);
+                           resetCallFlow();
+                       } else {
+                           speakText("Okay, returning to menu.", "reset");
+                           resetCallFlow();
+                       }
+                   }
+               } else if ("dial".equals(currentAction)) {
+                   if (stepIndex == 1) {
+                       tempNumber = cleanNumber(userSpeech);
+                       if (isValidMalaysiaNumber(tempNumber)) {
+                           speakConfirm("Did you say " + tempNumber + "?");
+                           stepIndex = 2;
+                       } else {
+                           speakText("That doesn't seem like a valid Malaysian number. Returning to menu.", "reset");
+                           resetCallFlow();
+                       }
+                   } else if (stepIndex == 2) {
+                       if (userSpeech.contains("yes")) {
+                           boolean success = makePhoneCall(tempNumber);
+                           if (!success) {
+                               speakText("Call failed. Say again to retry, or later to return to menu.", "reset");
+                               stepIndex = 3;
+                           } else resetCallFlow();
+                       } else {
+                           speakText("Okay, returning to menu.", "reset");
+                           resetCallFlow();
+                       }
+                   } else if (stepIndex == 3) {
+                       if (userSpeech.contains("again")) {
+                           makePhoneCall(tempNumber);
+                           resetCallFlow();
+                       } else {
+                           speakText("Okay, returning to menu.", "reset");
+                           resetCallFlow();
+                       }
+                   }
+               } else if ("add_contact".equals(currentAction)) {
+                   if (stepIndex == 1) {
+                       tempName = userSpeech.trim();
+                       speakText("Now tell me the number for " + tempName, "reset");
+                       stepIndex = 2;
+                   } else if (stepIndex == 2) {
+                       tempNumber = cleanNumber(userSpeech);
+                       if (isValidMalaysiaNumber(tempNumber)) {
+                           speakConfirm("Did you say " + tempName + " with number " + tempNumber + "?");
+                           stepIndex = 3;
+                       } else {
+                           speakText("That doesn't seem like a valid Malaysian number. Returning to menu.", "reset");
+                           resetCallFlow();
+                       }
+                   } else if (stepIndex == 3) {
+                       if (userSpeech.contains("yes")) {
+                           saveContact(tempName, tempNumber);
+                           speakText("Contact saved successfully. Returning to menu.", "reset");
+                           resetCallFlow();
+                       } else if (userSpeech.contains("again")) {
+                           speakText("Okay, tell me the name again.", "reset");
+                           stepIndex = 1;
+                       } else {
+                           speakText("Okay, returning to menu.", "reset");
+                           resetCallFlow();
+                       }
+                   }
+               }
+           }
+
+    // =========================================================
+    // COMMAND HANDLER
+    // =========================================================
+    private void processCommand(String command) {
+               command = command.toLowerCase().trim();
+
+               // ✅ Global menu triggers
+               if (command.contains("menu") || command.contains("start")) {
+                   speakText("Returning to main menu.", "reset");
+                   resetCallFlow();
+                   return;
+               }
+
+               // ✅ Global "later" → back to menu
+               if (command.contains("later")) {
+                   speakText("Okay, returning to main menu.", "reset");
+                   resetCallFlow();
+                   return;
+               }
+
+               // ✅ Global "again" → repeat last step
+               if (command.contains("again")) {
+                   if (currentAction != null && stepIndex > 0) {
+                       repeatLastStep();
+                   } else {
+                       speakText("There's nothing to repeat. Returning to main menu.", "reset");
+                       resetCallFlow();
+                   }
+                   return;
+               }
+
+               if (currentAction != null) {
+                   if ("news".equals(currentAction)) {
+                       if (command.contains("yes") || command.contains("more")) {
+                           readNextHeadline();//fetch another headline
+                           return;
+                       } else if (command.contains("no") || command.contains("stop")) {
+                           speakText("Okay, returning to main menu.", "reset");
+                           resetCallFlow();
+                           return;
+                       }
+                   } else {
+                       handleCallFlow(command);
+                       return;
+                   }
+               }
+
+               // Time & date
+               if (command.contains("time") && command.contains("date")) {
+                   SimpleDateFormat sdf = new SimpleDateFormat("hh:mm a", Locale.getDefault());
+                   speakText("Current time is " + sdf.format(new Date()) + " and today's date is " +
+                           java.text.DateFormat.getDateInstance().format(new Date()) +
+                           ". Say start to return to menu.", "time_response");
+                   vibrateTwice();
+                   return;
+               }
+               if (command.contains("time")) {
+                   SimpleDateFormat sdf = new SimpleDateFormat("hh:mm a", Locale.getDefault());
+                   speakText("Current time is " + sdf.format(new Date()) + ". Say start to return to menu.", "time_response");
+                   vibrateTwice();
+                   return;
+               }
+               if (command.contains("date")) {
+                   speakText("Today's date is " + java.text.DateFormat.getDateInstance().format(new Date()) +
+                           ". Say start to return to menu.", "date_response");
+                   vibrateTwice();
+                   return;
+               }
+
+               // Weather
+               if (command.contains("weather") || command.contains("temperature")) {
+                   String city = command.replaceAll(".*in ", "").trim();
+                   fetchWeather(city);
+                   vibrateTwice();
+                   return;
+               }
+
+               // Call / Dial / Add Contact
+               if (command.contains("call") || command.contains("dial") || command.contains("add contact")) {
+                   handleCallFlow(command);
+                   return;
+               }
+               //News
+               if(command.contains("news")||command.contains("headline") || command.contains("breaking")) {
+                   fetchNews();
+                   vibrateTwice();
+                   return;
+               }
+
+               speakText("You said: " + command + ". I didn't understand. Say start to return to menu.", "reset");
+           }
+       }

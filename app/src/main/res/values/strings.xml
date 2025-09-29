@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">FYP</string>
+    <string name="SaySomething">Say Something</string>
+    <string name="StartListening">Listening</string>
+</resources>
